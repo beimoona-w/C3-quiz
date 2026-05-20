@@ -85,6 +85,8 @@ export default function App() {
     } else {
       pool = questions.filter(q => !doneIds.has(q.seq))
       if (filterType !== 'all') pool = pool.filter(q => q.type === filterType)
+      pool = pool.sort(() => Math.random() - 0.5)
+      if (mode === 'daily') {
       if (mode === 'daily') {
         const plan = buildPlan(questions.length, doneIds.size, examDate)
         pool = pool.slice(0, plan.perDay)
