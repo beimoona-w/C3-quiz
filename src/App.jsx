@@ -90,7 +90,6 @@ export default function App() {
         pool = pool.slice(0, plan.perDay)
       }
     }
-    pool = pool.sort(() => Math.random() - 0.5)
     if (pool.length === 0) { alert(mode === 'wrong' ? '错题集为空！' : '当前分类已全部完成！'); return }
     setQuizQueue(pool)
     setQuizIdx(0)
