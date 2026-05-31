@@ -4,6 +4,8 @@ import { getLocalSyncCode, setSyncCode, loadProgress, saveProgressDebounced, sav
 // ─── Constants ────────────────────────────────────────────────────────────────
 const TYPE_LABEL = { single: '单选', multi: '多选', judge: '判断' }
 const TYPE_COLOR = { single: '#3B82F6', multi: '#8B5CF6', judge: '#10B981' }
+const EXAM_CONFIG = { single: 50, multi: 10, judge: 18 } // 题型数量
+const EXAM_DURATION = 90 * 60 // 90分钟
 
 const today = () => new Date().toISOString().slice(0, 10)
 const daysBetween = (a, b) => Math.max(1, Math.ceil((new Date(b) - new Date(a)) / 86400000))
@@ -14,42 +16,36 @@ export default function App() {
   const [examDate, setExamDate] = useState(() => localStorage.getItem('examDate') || '')
   const [progress, setProgress] = useState({})
   const [syncCode, setSyncCodeState] = useState(() => getLocalSyncCode())
-  const [view, setView] = useState('loading') // loading | setup | dash | quiz | result | plan | sync
+  const [view, setView] = useState('loading')
   const [quizQueue, setQuizQueue] = useState([])
   const [quizIdx, setQuizIdx] = useState(0)
   const [sessionStats, setSessionStats] = useState({ correct: 0, wrong: 0 })
   const [selectedOpts, setSelectedOpts] = useState([])
   const [submitted, setSubmitted] = useState(false)
   const [filterType, setFilterType] = useState('all')
-  const [syncStatus, setSyncStatus] = useState('idle') // idle | syncing | ok | err
+  const [syncStatus, setSyncStatus] = useState('idle')
   const [loadingMsg, setLoadingMsg] = useState('加载题库中…')
+  // Exam state
+  const [examQueue, setExamQueue] = useState([])
+  const [examResult, setExamResult] = useState(null)
 
-  // ── Load questions + progress
   useEffect(() => {
     async function bootstrap() {
-      // 1. Load questions
       setLoadingMsg('加载题库中…')
       const res = await fetch('/questions.json')
       const qs = await res.json()
       setQuestions(qs)
-
-      // 2. Load progress from cloud
       setLoadingMsg('同步进度中…')
       const code = getLocalSyncCode()
       const cloudProg = await loadProgress(code)
       const localProg = JSON.parse(localStorage.getItem('quiz_progress') || '{}')
-
-      // Merge: cloud wins on conflicts (newer updatedAt)
       const merged = { ...localProg, ...(cloudProg || {}) }
       setProgress(merged)
       localStorage.setItem('quiz_progress', JSON.stringify(merged))
-
       const date = localStorage.getItem('examDate')
       setView(date ? 'dash' : 'setup')
     }
-    bootstrap().catch(e => {
-      console.error(e)
-      // Fallback to local
+    bootstrap().catch(() => {
       const localProg = JSON.parse(localStorage.getItem('quiz_progress') || '{}')
       setProgress(localProg)
       const date = localStorage.getItem('examDate')
@@ -57,7 +53,6 @@ export default function App() {
     })
   }, [])
 
-  // ── Persist progress
   const updateProgress = useCallback((newProg) => {
     setProgress(newProg)
     localStorage.setItem('quiz_progress', JSON.stringify(newProg))
@@ -70,13 +65,12 @@ export default function App() {
     setView('dash')
   }
 
-  // ── Derived
   const doneIds = new Set(Object.keys(progress).map(Number))
   const wrongIds = new Set(
     Object.entries(progress).filter(([, v]) => !v.correct).map(([k]) => Number(k))
   )
 
-  // ── Start quiz
+  // ── Start quiz (刷题模式)
   const startQuiz = useCallback((mode) => {
     if (!questions) return
     let pool
@@ -90,6 +84,7 @@ export default function App() {
         pool = pool.slice(0, plan.perDay)
       }
     }
+    pool = pool.sort(() => Math.random() - 0.5)
     if (pool.length === 0) { alert(mode === 'wrong' ? '错题集为空！' : '当前分类已全部完成！'); return }
     setQuizQueue(pool)
     setQuizIdx(0)
@@ -99,17 +94,55 @@ export default function App() {
     setView('quiz')
   }, [questions, progress, filterType, examDate])
 
-  // ── Answer logic
+  // ── Start exam (模拟考试)
+  const startExam = useCallback(() => {
+    if (!questions) return
+    const pick = (type, n) => {
+      const pool = questions.filter(q => q.type === type).sort(() => Math.random() - 0.5)
+      return pool.slice(0, Math.min(n, pool.length))
+    }
+    const queue = [
+      ...pick('single', EXAM_CONFIG.single),
+      ...pick('multi', EXAM_CONFIG.multi),
+      ...pick('judge', EXAM_CONFIG.judge),
+    ]
+    setExamQueue(queue)
+    setExamResult(null)
+    setView('exam')
+  }, [questions])
+
+  // ── Exam submit
+  const submitExam = useCallback((answers) => {
+    let score = 0
+    const newProg = { ...progress }
+    const breakdown = { single: { correct: 0, total: 0 }, multi: { correct: 0, total: 0 }, judge: { correct: 0, total: 0 } }
+
+    examQueue.forEach(q => {
+      const userAnswer = (answers[q.seq] || []).sort().join('')
+      const correct = userAnswer === q.answer
+      newProg[q.seq] = { userAnswer: userAnswer || '', correct, fromExam: true }
+      breakdown[q.type].total++
+      if (correct) {
+        breakdown[q.type].correct++
+        score += q.type === 'multi' ? 2 : 1
+      }
+    })
+
+    updateProgress(newProg)
+    const totalPossible = EXAM_CONFIG.single * 1 + EXAM_CONFIG.multi * 2 + EXAM_CONFIG.judge * 1
+    setExamResult({ score, totalPossible, breakdown, answers, queue: examQueue })
+    setView('exam-result')
+  }, [examQueue, progress, updateProgress])
+
+  // ── Quiz answer logic
   const handleSelect = useCallback((key) => {
     if (submitted) return
     const q = quizQueue[quizIdx]
     if (q.type === 'multi') {
       setSelectedOpts(prev => prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key])
     } else {
-      // Single/judge: auto-submit
-      const userAnswer = key
-      const correct = userAnswer === q.answer
-      const newProg = { ...progress, [q.seq]: { userAnswer, correct } }
+      const correct = key === q.answer
+      const newProg = { ...progress, [q.seq]: { userAnswer: key, correct } }
       updateProgress(newProg)
       setSessionStats(s => ({ correct: s.correct + (correct ? 1 : 0), wrong: s.wrong + (correct ? 0 : 1) }))
       setSelectedOpts([key])
@@ -141,7 +174,6 @@ export default function App() {
     saveProgress(syncCode, {})
   }
 
-  // ── Sync code change
   const applySyncCode = async (code) => {
     setSyncStatus('syncing')
     setSyncCode(code)
@@ -163,6 +195,7 @@ export default function App() {
       questions={questions} progress={progress} wrongIds={wrongIds}
       doneIds={doneIds} examDate={examDate} filterType={filterType}
       onFilterChange={setFilterType} onStartQuiz={startQuiz}
+      onStartExam={startExam}
       onPlan={() => setView('plan')} onSync={() => setView('sync')}
       syncCode={syncCode} onReset={resetAll}
     />
@@ -177,16 +210,19 @@ export default function App() {
     />
   )
   if (view === 'result') return (
-    <ResultScreen stats={sessionStats} total={quizQueue.length}
-      onDash={() => setView('dash')} />
+    <ResultScreen stats={sessionStats} total={quizQueue.length} onDash={() => setView('dash')} />
+  )
+  if (view === 'exam') return (
+    <ExamScreen queue={examQueue} onSubmit={submitExam} onExit={() => setView('dash')} />
+  )
+  if (view === 'exam-result') return (
+    <ExamResultScreen result={examResult} onDash={() => setView('dash')} />
   )
   if (view === 'plan') return (
-    <PlanScreen questions={questions} doneIds={doneIds} examDate={examDate}
-      onBack={() => setView('dash')} />
+    <PlanScreen questions={questions} doneIds={doneIds} examDate={examDate} onBack={() => setView('dash')} />
   )
   if (view === 'sync') return (
-    <SyncScreen syncCode={syncCode} status={syncStatus}
-      onApply={applySyncCode} onBack={() => setView('dash')} />
+    <SyncScreen syncCode={syncCode} status={syncStatus} onApply={applySyncCode} onBack={() => setView('dash')} />
   )
   return null
 }
@@ -232,14 +268,13 @@ function Setup({ onSave }) {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterType, onFilterChange, onStartQuiz, onPlan, onSync, syncCode, onReset }) {
+function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterType, onFilterChange, onStartQuiz, onStartExam, onPlan, onSync, syncCode, onReset }) {
   const total = questions?.length || 0
   const done = doneIds.size
   const correct = Object.values(progress).filter(v => v.correct).length
   const pct = total ? Math.round(done / total * 100) : 0
   const plan = buildPlan(total, done, examDate)
   const daysLeft = examDate ? daysBetween(today(), examDate) : '—'
-
   const typeStats = ['single', 'multi', 'judge'].map(t => {
     const qs = questions?.filter(q => q.type === t) || []
     return { type: t, total: qs.length, done: qs.filter(q => doneIds.has(q.seq)).length }
@@ -247,7 +282,6 @@ function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterTyp
 
   return (
     <div style={S.page}>
-      {/* Header */}
       <div style={S.header}>
         <div>
           <div style={S.headerTitle}>C3 刷题本</div>
@@ -255,11 +289,10 @@ function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterTyp
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <Btn icon onClick={onPlan}>📅</Btn>
-          <Btn icon onClick={onSync} title="同步码">🔄</Btn>
+          <Btn icon onClick={onSync}>🔄</Btn>
         </div>
       </div>
 
-      {/* Progress */}
       <div style={{ ...S.card, margin: '12px 16px', display: 'flex', gap: 20, alignItems: 'center' }}>
         <Ring pct={pct} done={done} total={total} />
         <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
@@ -270,7 +303,6 @@ function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterTyp
         </div>
       </div>
 
-      {/* Type bars */}
       <div style={S.section}>
         <div style={S.secTitle}>题型进度</div>
         {typeStats.map(({ type, total: t, done: d }) => (
@@ -278,7 +310,6 @@ function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterTyp
         ))}
       </div>
 
-      {/* Filter */}
       <div style={S.section}>
         <div style={S.secTitle}>题型筛选</div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -289,9 +320,8 @@ function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterTyp
         </div>
       </div>
 
-      {/* Actions */}
       <div style={S.section}>
-        <div style={S.secTitle}>开始答题</div>
+        <div style={S.secTitle}>刷题模式</div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
           <ActionCard icon="📖" title="今日计划" sub={`${plan.perDay} 题`} color="#3B82F6" onClick={() => onStartQuiz('daily')} />
           <ActionCard icon="❌" title="错题复习" sub={`${wrongIds.size} 题`} color="#EF4444" onClick={() => onStartQuiz('wrong')} disabled={wrongIds.size === 0} />
@@ -299,11 +329,331 @@ function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterTyp
         </div>
       </div>
 
+      {/* 模拟考试入口 */}
+      <div style={S.section}>
+        <div style={S.secTitle}>模拟考试</div>
+        <button onClick={onStartExam} style={S.examEntryBtn}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+            <span style={{ fontSize: 32 }}>🎯</span>
+            <div style={{ textAlign: 'left' }}>
+              <div style={{ fontWeight: 700, fontSize: 16, color: '#F1F5F9' }}>开始模拟考试</div>
+              <div style={{ fontSize: 12, color: '#94A3B8', marginTop: 2 }}>单选50 · 多选10 · 判断18 · 限时90分钟</div>
+            </div>
+          </div>
+          <div style={{ fontSize: 18, color: '#94A3B8' }}>→</div>
+        </button>
+      </div>
+
       <div style={{ padding: '0 16px 8px', fontSize: 12, color: '#475569', textAlign: 'center' }}>
         同步码：<strong style={{ color: '#64748B' }}>{syncCode}</strong>
       </div>
       <div style={{ padding: '0 16px 32px' }}>
         <button style={{ ...S.btnGhost, width: '100%' }} onClick={onReset}>清空答题记录</button>
+      </div>
+    </div>
+  )
+}
+
+// ─── Exam Screen ──────────────────────────────────────────────────────────────
+function ExamScreen({ queue, onSubmit, onExit }) {
+  const [idx, setIdx] = useState(0)
+  const [answers, setAnswers] = useState({}) // {seq: [keys]}
+  const [timeLeft, setTimeLeft] = useState(EXAM_DURATION)
+  const [showPalette, setShowPalette] = useState(false)
+  const [confirmSubmit, setConfirmSubmit] = useState(false)
+  const timerRef = useRef(null)
+
+  useEffect(() => {
+    timerRef.current = setInterval(() => {
+      setTimeLeft(t => {
+        if (t <= 1) { clearInterval(timerRef.current); handleSubmit(); return 0 }
+        return t - 1
+      })
+    }, 1000)
+    return () => clearInterval(timerRef.current)
+  }, [])
+
+  const handleSubmit = useCallback(() => {
+    clearInterval(timerRef.current)
+    onSubmit(answers)
+  }, [answers, onSubmit])
+
+  const q = queue[idx]
+  const sel = answers[q?.seq] || []
+  const mins = String(Math.floor(timeLeft / 60)).padStart(2, '0')
+  const secs = String(timeLeft % 60).padStart(2, '0')
+  const isLow = timeLeft < 300
+  const answeredCount = Object.keys(answers).length
+  const unansweredCount = queue.length - answeredCount
+
+  const toggleOpt = (key) => {
+    if (!q) return
+    setAnswers(prev => {
+      const cur = prev[q.seq] || []
+      if (q.type === 'multi') {
+        const next = cur.includes(key) ? cur.filter(k => k !== key) : [...cur, key]
+        return { ...prev, [q.seq]: next }
+      } else {
+        return { ...prev, [q.seq]: [key] }
+      }
+    })
+    // Auto advance single/judge after short delay
+    if (q.type !== 'multi') {
+      setTimeout(() => {
+        if (idx < queue.length - 1) setIdx(i => i + 1)
+      }, 300)
+    }
+  }
+
+  // Section boundaries
+  const singleEnd = EXAM_CONFIG.single
+  const multiEnd = singleEnd + EXAM_CONFIG.multi
+  const getSectionLabel = (i) => {
+    if (i < singleEnd) return '单选'
+    if (i < multiEnd) return '多选'
+    return '判断'
+  }
+
+  if (!q) return null
+
+  return (
+    <div style={S.page}>
+      {/* Timer bar */}
+      <div style={{ ...S.examTimerBar, background: isLow ? '#7F1D1D' : '#1E293B' }}>
+        <button style={{ background: 'transparent', border: 'none', color: '#94A3B8', fontSize: 16, cursor: 'pointer', padding: '0 4px' }}
+          onClick={() => { if (confirm('确定退出模拟考试？进度将丢失。')) onExit() }}>✕</button>
+        <div style={{ flex: 1, textAlign: 'center' }}>
+          <span style={{ fontSize: 11, color: '#64748B', marginRight: 8 }}>模拟考试</span>
+          <span style={{ ...S.examTimer, color: isLow ? '#FCA5A5' : '#F1F5F9' }}>
+            {isLow && '⏰ '}{mins}:{secs}
+          </span>
+        </div>
+        <button style={{ background: 'transparent', border: 'none', color: '#94A3B8', fontSize: 13, cursor: 'pointer', padding: '0 4px' }}
+          onClick={() => setShowPalette(true)}>
+          {answeredCount}/{queue.length}
+        </button>
+      </div>
+
+      {/* Progress bar */}
+      <div style={{ height: 3, background: '#1E293B' }}>
+        <div style={{ height: '100%', width: `${(idx + 1) / queue.length * 100}%`, background: isLow ? '#EF4444' : '#3B82F6', transition: 'width .2s' }} />
+      </div>
+
+      {/* Question */}
+      <div style={{ ...S.card, margin: '12px 16px 10px', flexShrink: 0 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <span style={{ ...S.typeBadge, background: TYPE_COLOR[q.type] + '22', color: TYPE_COLOR[q.type] }}>
+            {TYPE_LABEL[q.type]}题
+          </span>
+          <span style={{ fontSize: 12, color: '#64748B' }}>第 {idx + 1} 题 / 共 {queue.length} 题</span>
+        </div>
+        <div style={S.stem}>{q.stem}</div>
+        {q.type === 'multi' && (
+          <div style={{ marginTop: 10, fontSize: 12, color: '#8B5CF6', background: '#1E1B4B', borderRadius: 6, padding: '4px 10px', display: 'inline-block' }}>
+            多选题，可选多项
+          </div>
+        )}
+      </div>
+
+      {/* Options */}
+      <div style={{ padding: '0 16px', display: 'flex', flexDirection: 'column', gap: 8, flex: 1, overflowY: 'auto' }}>
+        {Object.entries(q.options).map(([key, val]) => {
+          const isSelected = sel.includes(key)
+          return (
+            <button key={key} onClick={() => toggleOpt(key)}
+              style={{ ...S.optBtn, ...(isSelected ? { borderColor: '#3B82F6', background: '#1E3A5F' } : {}) }}>
+              <span style={{
+                width: 28, height: 28, borderRadius: 6, flexShrink: 0,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 13, fontWeight: 700,
+                background: isSelected ? '#3B82F6' : '#0F172A',
+                color: isSelected ? '#fff' : '#94A3B8'
+              }}>{key}</span>
+              <span style={{ fontSize: 15, color: '#CBD5E1', flex: 1, lineHeight: 1.6, textAlign: 'left' }}>{val}</span>
+            </button>
+          )
+        })}
+      </div>
+
+      {/* Navigation */}
+      <div style={{ padding: '12px 16px 16px', display: 'flex', gap: 10 }}>
+        <button style={{ ...S.btnGhost, flex: 1, border: '1px solid #334155', borderRadius: 10, padding: 12, opacity: idx === 0 ? 0.3 : 1 }}
+          disabled={idx === 0} onClick={() => setIdx(i => i - 1)}>← 上一题</button>
+        {idx < queue.length - 1
+          ? <button style={{ ...S.btnPrimary, flex: 2, borderRadius: 10 }} onClick={() => setIdx(i => i + 1)}>下一题 →</button>
+          : <button style={{ ...S.btnPrimary, flex: 2, borderRadius: 10, background: '#10B981' }}
+              onClick={() => setConfirmSubmit(true)}>交卷 ✓</button>
+        }
+      </div>
+
+      {/* Submit confirm */}
+      {confirmSubmit && (
+        <div style={S.modal}>
+          <div style={S.modalCard}>
+            <div style={{ fontSize: 28, marginBottom: 12 }}>📝</div>
+            <div style={{ fontWeight: 700, fontSize: 17, marginBottom: 8 }}>确认交卷？</div>
+            <div style={{ fontSize: 14, color: '#94A3B8', marginBottom: 20, lineHeight: 1.6 }}>
+              已答 <strong style={{ color: '#F1F5F9' }}>{answeredCount}</strong> 题，
+              未答 <strong style={{ color: unansweredCount > 0 ? '#EF4444' : '#10B981' }}>{unansweredCount}</strong> 题
+              {unansweredCount > 0 && <div style={{ color: '#F59E0B', marginTop: 4, fontSize: 13 }}>⚠ 还有未作答题目</div>}
+            </div>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button style={{ ...S.btnGhost, flex: 1, border: '1px solid #334155', borderRadius: 10, padding: 12 }}
+                onClick={() => setConfirmSubmit(false)}>继续答题</button>
+              <button style={{ ...S.btnPrimary, flex: 1, borderRadius: 10, background: '#10B981' }}
+                onClick={handleSubmit}>确认交卷</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Question palette */}
+      {showPalette && (
+        <div style={S.modal} onClick={() => setShowPalette(false)}>
+          <div style={{ ...S.modalCard, maxHeight: '80vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <div style={{ fontWeight: 700 }}>答题卡</div>
+              <button style={{ background: 'transparent', border: 'none', color: '#94A3B8', fontSize: 18, cursor: 'pointer' }} onClick={() => setShowPalette(false)}>✕</button>
+            </div>
+            {['单选题 (1-50)', '多选题 (51-60)', '判断题 (61-78)'].map((label, si) => {
+              const start = si === 0 ? 0 : si === 1 ? EXAM_CONFIG.single : EXAM_CONFIG.single + EXAM_CONFIG.multi
+              const end = si === 0 ? EXAM_CONFIG.single : si === 1 ? EXAM_CONFIG.single + EXAM_CONFIG.multi : queue.length
+              return (
+                <div key={si} style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 12, color: '#64748B', marginBottom: 8 }}>{label}</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {queue.slice(start, end).map((qq, i) => {
+                      const globalIdx = start + i
+                      const isAns = !!(answers[qq.seq]?.length)
+                      const isCur = globalIdx === idx
+                      return (
+                        <button key={qq.seq} onClick={() => { setIdx(globalIdx); setShowPalette(false) }}
+                          style={{
+                            width: 36, height: 36, borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                            border: isCur ? '2px solid #3B82F6' : '1px solid #334155',
+                            background: isCur ? '#1E3A5F' : isAns ? '#10B981' : '#1E293B',
+                            color: isAns || isCur ? '#fff' : '#64748B'
+                          }}>
+                          {globalIdx + 1}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              )
+            })}
+            <div style={{ display: 'flex', gap: 12, fontSize: 12, color: '#64748B', marginTop: 8 }}>
+              <span>🟢 已作答</span>
+              <span>⬜ 未作答</span>
+              <span>🔵 当前</span>
+            </div>
+            <button style={{ ...S.btnPrimary, width: '100%', marginTop: 16, background: '#10B981', borderRadius: 10 }}
+              onClick={() => { setShowPalette(false); setConfirmSubmit(true) }}>交卷</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Exam Result Screen ───────────────────────────────────────────────────────
+function ExamResultScreen({ result, onDash }) {
+  const { score, totalPossible, breakdown, answers, queue } = result
+  const passed = score >= 60
+  const rate = Math.round(score / 100 * 100)
+  const [showWrong, setShowWrong] = useState(false)
+  const wrongQs = queue.filter(q => {
+    const ua = (answers[q.seq] || []).sort().join('')
+    return ua !== q.answer
+  })
+
+  return (
+    <div style={S.page}>
+      <div style={S.header}>
+        <div style={{ ...S.headerTitle }}>模拟考试结果</div>
+      </div>
+
+      {/* Score card */}
+      <div style={{ margin: 16, background: passed ? '#052E16' : '#450A0A', borderRadius: 16, padding: 28, textAlign: 'center', border: `1px solid ${passed ? '#10B981' : '#EF4444'}` }}>
+        <div style={{ fontSize: 13, color: passed ? '#4ADE80' : '#FCA5A5', letterSpacing: 2, marginBottom: 8 }}>
+          {passed ? '✅ 恭喜通过！' : '❌ 未通过，继续加油'}
+        </div>
+        <div style={{ fontSize: 72, fontWeight: 900, color: passed ? '#4ADE80' : '#F87171', lineHeight: 1 }}>
+          {score}
+        </div>
+        <div style={{ fontSize: 14, color: '#64748B', marginTop: 4 }}>满分 100 分 · 及格线 60 分</div>
+      </div>
+
+      {/* Breakdown */}
+      <div style={{ ...S.card, margin: '0 16px 16px' }}>
+        <div style={S.secTitle}>各题型得分</div>
+        {[
+          { type: 'single', label: '单选题', points: 1, total: EXAM_CONFIG.single },
+          { type: 'multi', label: '多选题', points: 2, total: EXAM_CONFIG.multi },
+          { type: 'judge', label: '判断题', points: 1, total: EXAM_CONFIG.judge },
+        ].map(({ type, label, points, total }) => {
+          const { correct, total: t } = breakdown[type]
+          const got = correct * points
+          const max = total * points
+          const pct = Math.round(correct / t * 100)
+          return (
+            <div key={type} style={{ marginBottom: 14 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5, fontSize: 14 }}>
+                <span style={{ ...S.typeBadge, background: TYPE_COLOR[type] + '22', color: TYPE_COLOR[type] }}>{label}</span>
+                <span style={{ color: '#F1F5F9' }}>{got} / {max} 分（{correct}/{t} 题，{pct}%）</span>
+              </div>
+              <Bar pct={pct} color={TYPE_COLOR[type]} />
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Wrong questions review */}
+      {wrongQs.length > 0 && (
+        <div style={{ margin: '0 16px 16px' }}>
+          <button style={{ ...S.examEntryBtn, justifyContent: 'space-between' }}
+            onClick={() => setShowWrong(!showWrong)}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <span style={{ fontSize: 24 }}>❌</span>
+              <div style={{ textAlign: 'left' }}>
+                <div style={{ fontWeight: 700, color: '#F1F5F9' }}>查看错题（{wrongQs.length} 道）</div>
+                <div style={{ fontSize: 12, color: '#94A3B8' }}>已自动加入错题库</div>
+              </div>
+            </div>
+            <span style={{ color: '#94A3B8', transition: 'transform .2s', transform: showWrong ? 'rotate(90deg)' : '' }}>▶</span>
+          </button>
+          {showWrong && (
+            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {wrongQs.map((q, i) => {
+                const ua = (answers[q.seq] || []).sort().join('') || '（未作答）'
+                return (
+                  <div key={q.seq} style={{ ...S.card, borderLeft: `3px solid ${TYPE_COLOR[q.type]}` }}>
+                    <div style={{ fontSize: 12, color: '#64748B', marginBottom: 6 }}>
+                      <span style={{ ...S.typeBadge, background: TYPE_COLOR[q.type] + '22', color: TYPE_COLOR[q.type] }}>{TYPE_LABEL[q.type]}</span>
+                      <span style={{ marginLeft: 8 }}>第{q.id}题</span>
+                    </div>
+                    <div style={{ fontSize: 14, color: '#E2E8F0', lineHeight: 1.6, marginBottom: 10 }}>{q.stem}</div>
+                    {Object.entries(q.options).map(([k, v]) => (
+                      <div key={k} style={{ fontSize: 13, padding: '4px 8px', marginBottom: 3, borderRadius: 5,
+                        background: q.answer.includes(k) ? '#052E16' : ua.includes(k) ? '#2D0B0B' : 'transparent',
+                        color: q.answer.includes(k) ? '#4ADE80' : ua.includes(k) ? '#FCA5A5' : '#94A3B8' }}>
+                        {k}. {v} {q.answer.includes(k) ? '✓' : ua.includes(k) ? '✗' : ''}
+                      </div>
+                    ))}
+                    <div style={{ fontSize: 12, marginTop: 8, color: '#64748B' }}>
+                      你的答案：<span style={{ color: '#FCA5A5' }}>{ua}</span>
+                      　正确答案：<span style={{ color: '#4ADE80' }}>{q.answer}</span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ padding: '0 16px 32px' }}>
+        <button style={{ ...S.btnPrimary, width: '100%', borderRadius: 10 }} onClick={onDash}>返回主页</button>
       </div>
     </div>
   )
@@ -319,7 +669,6 @@ function QuizScreen({ q, qIdx, total, stats, selectedOpts, submitted, onSelect, 
 
   return (
     <div style={S.page}>
-      {/* Top bar */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px 0' }}>
         <Btn icon onClick={onExit}>✕</Btn>
         <span style={{ color: '#94A3B8', fontSize: 14 }}>{qIdx + 1} / {total}</span>
@@ -328,13 +677,9 @@ function QuizScreen({ q, qIdx, total, stats, selectedOpts, submitted, onSelect, 
           <Badge color="#EF4444">✗{stats.wrong}</Badge>
         </div>
       </div>
-
-      {/* Progress bar */}
       <div style={{ height: 3, background: '#1E293B', margin: '10px 0' }}>
         <div style={{ height: '100%', width: `${pct}%`, background: '#3B82F6', transition: 'width .3s' }} />
       </div>
-
-      {/* Question card */}
       <div style={{ ...S.card, margin: '0 16px 14px', flexShrink: 0 }}>
         <div style={{ marginBottom: 10 }}>
           <span style={{ ...S.typeBadge, background: TYPE_COLOR[q.type] + '22', color: TYPE_COLOR[q.type] }}>
@@ -353,8 +698,6 @@ function QuizScreen({ q, qIdx, total, stats, selectedOpts, submitted, onSelect, 
           </div>
         )}
       </div>
-
-      {/* Options */}
       <div style={{ padding: '0 16px', display: 'flex', flexDirection: 'column', gap: 8, flex: 1, overflowY: 'auto' }}>
         {Object.entries(q.options).map(([key, val]) => {
           const sel = selectedOpts.includes(key)
@@ -363,12 +706,9 @@ function QuizScreen({ q, qIdx, total, stats, selectedOpts, submitted, onSelect, 
           if (submitted) {
             if (isAns) extra = { borderColor: '#10B981', background: '#052E16' }
             else if (sel) extra = { borderColor: '#EF4444', background: '#2D0B0B' }
-          } else if (sel) {
-            extra = { borderColor: '#3B82F6', background: '#1E3A5F' }
-          }
+          } else if (sel) extra = { borderColor: '#3B82F6', background: '#1E3A5F' }
           return (
-            <button key={key} onClick={() => onSelect(key)}
-              style={{ ...S.optBtn, ...extra }}>
+            <button key={key} onClick={() => onSelect(key)} style={{ ...S.optBtn, ...extra }}>
               <span style={{
                 width: 28, height: 28, borderRadius: 6, flexShrink: 0,
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -377,26 +717,18 @@ function QuizScreen({ q, qIdx, total, stats, selectedOpts, submitted, onSelect, 
                 color: (submitted && isAns) || (!submitted && sel) ? '#fff' : '#94A3B8'
               }}>{key}</span>
               <span style={{ fontSize: 15, color: '#CBD5E1', flex: 1, lineHeight: 1.6, textAlign: 'left' }}>{val}</span>
-              {submitted && isAns && <span style={{ color: '#10B981', fontSize: 16 }}>✓</span>}
-              {submitted && sel && !isAns && <span style={{ color: '#EF4444', fontSize: 16 }}>✗</span>}
+              {submitted && isAns && <span style={{ color: '#10B981' }}>✓</span>}
+              {submitted && sel && !isAns && <span style={{ color: '#EF4444' }}>✗</span>}
             </button>
           )
         })}
       </div>
-
-      {/* Result banner */}
       {submitted && (
         <div style={{ margin: '12px 16px 0', padding: '12px 16px', borderRadius: 10, background: isCorrect ? '#064E3B' : '#450A0A' }}>
           <div style={{ fontSize: 17, fontWeight: 600 }}>{isCorrect ? '✅ 回答正确！' : '❌ 回答错误'}</div>
-          {!isCorrect && (
-            <div style={{ fontSize: 14, marginTop: 4, color: '#FCA5A5' }}>
-              正确答案：<strong style={{ color: '#4ADE80' }}>{q.answer}</strong>
-            </div>
-          )}
+          {!isCorrect && <div style={{ fontSize: 14, marginTop: 4, color: '#FCA5A5' }}>正确答案：<strong style={{ color: '#4ADE80' }}>{q.answer}</strong></div>}
         </div>
       )}
-
-      {/* Bottom */}
       <div style={{ padding: 16 }}>
         {q.type === 'multi' && !submitted
           ? <button style={{ ...S.btnPrimary, width: '100%', opacity: selectedOpts.length > 0 ? 1 : 0.4 }}
@@ -430,7 +762,6 @@ function PlanScreen({ questions, doneIds, examDate, onBack }) {
   const done = doneIds.size
   const plan = buildPlan(total, done, examDate)
   const daysLeft = examDate ? daysBetween(today(), examDate) : 30
-
   return (
     <div style={S.page}>
       <div style={S.header}>
@@ -438,19 +769,15 @@ function PlanScreen({ questions, doneIds, examDate, onBack }) {
         <div style={{ ...S.headerTitle, flex: 1, textAlign: 'center' }}>备考计划</div>
         <div style={{ width: 36 }} />
       </div>
-
       <div style={{ ...S.card, margin: 16 }}>
         <div style={{ display: 'flex', justifyContent: 'space-around', marginBottom: 20 }}>
           <PlanStat label="剩余天数" value={plan.days} />
           <PlanStat label="未做题目" value={plan.remaining} />
           <PlanStat label="每日目标" value={plan.perDay} color="#FBBF24" />
         </div>
-        <div style={{ color: '#94A3B8', fontSize: 13, marginBottom: 6 }}>
-          总进度：{done} / {total}（{Math.round(done / total * 100)}%）
-        </div>
+        <div style={{ color: '#94A3B8', fontSize: 13, marginBottom: 6 }}>总进度：{done} / {total}（{Math.round(done / total * 100)}%）</div>
         <Bar pct={Math.round(done / total * 100)} color="#3B82F6" />
       </div>
-
       <div style={{ padding: '0 16px' }}>
         <div style={S.secTitle}>题型分布</div>
         {['single', 'multi', 'judge'].map(t => {
@@ -469,7 +796,6 @@ function PlanScreen({ questions, doneIds, examDate, onBack }) {
           )
         })}
       </div>
-
       <div style={{ padding: '12px 16px 32px' }}>
         <div style={S.secTitle}>未来 {Math.min(daysLeft, 21)} 天日历</div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 4 }}>
@@ -504,29 +830,23 @@ function SyncScreen({ syncCode, status, onApply, onBack }) {
       <div style={{ padding: 16 }}>
         <div style={{ ...S.card, marginBottom: 16 }}>
           <div style={{ fontSize: 14, color: '#94A3B8', lineHeight: 1.8 }}>
-            你的<strong style={{ color: '#F1F5F9' }}>同步码</strong>是一个专属于你的 ID，在另一台设备上输入同样的同步码，即可读取云端进度。<br /><br />
-            ⚠️ 请妥善保存同步码，丢失后无法恢复云端进度。
+            你的<strong style={{ color: '#F1F5F9' }}>同步码</strong>是专属于你的 ID，在另一台设备上输入同样的同步码，即可读取云端进度。
           </div>
         </div>
-
         <div style={S.secTitle}>当前同步码</div>
         <div style={{ ...S.card, marginBottom: 16, textAlign: 'center' }}>
           <div style={{ fontSize: 32, fontWeight: 700, letterSpacing: 6, color: '#3B82F6', padding: '8px 0' }}>{syncCode}</div>
         </div>
-
-        <div style={S.secTitle}>切换到其他设备的同步码</div>
+        <div style={S.secTitle}>切换同步码</div>
         <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
           <input value={input} onChange={e => setInput(e.target.value.toUpperCase())}
-            placeholder="输入同步码（6位字母数字）"
-            style={{ ...S.input, flex: 1 }} maxLength={10} />
+            placeholder="输入同步码" style={{ ...S.input, flex: 1 }} maxLength={10} />
           <button style={{ ...S.btnPrimary, padding: '0 16px', flexShrink: 0 }}
-            onClick={() => onApply(input)} disabled={!input || input === syncCode}>
-            确认
-          </button>
+            onClick={() => onApply(input)} disabled={!input || input === syncCode}>确认</button>
         </div>
         {status === 'syncing' && <div style={{ color: '#94A3B8', fontSize: 13 }}>同步中…</div>}
-        {status === 'ok' && <div style={{ color: '#10B981', fontSize: 13 }}>✓ 同步成功，进度已加载</div>}
-        {status === 'err' && <div style={{ color: '#F59E0B', fontSize: 13 }}>⚠ 该同步码暂无云端数据，将使用本地进度</div>}
+        {status === 'ok' && <div style={{ color: '#10B981', fontSize: 13 }}>✓ 同步成功</div>}
+        {status === 'err' && <div style={{ color: '#F59E0B', fontSize: 13 }}>⚠ 该同步码暂无数据</div>}
       </div>
     </div>
   )
@@ -550,7 +870,6 @@ function Ring({ pct, done, total }) {
     </div>
   )
 }
-
 function Stat({ label, value, color }) {
   return (
     <div style={{ textAlign: 'center' }}>
@@ -559,7 +878,6 @@ function Stat({ label, value, color }) {
     </div>
   )
 }
-
 function PlanStat({ label, value, color = '#3B82F6' }) {
   return (
     <div style={{ textAlign: 'center' }}>
@@ -568,7 +886,6 @@ function PlanStat({ label, value, color = '#3B82F6' }) {
     </div>
   )
 }
-
 function TypeBar({ label, done, total, color }) {
   const pct = total ? Math.round(done / total * 100) : 0
   return (
@@ -581,7 +898,6 @@ function TypeBar({ label, done, total, color }) {
     </div>
   )
 }
-
 function Bar({ pct, color }) {
   return (
     <div style={{ height: 6, background: '#0F172A', borderRadius: 3, overflow: 'hidden' }}>
@@ -589,7 +905,6 @@ function Bar({ pct, color }) {
     </div>
   )
 }
-
 function ActionCard({ icon, title, sub, color, onClick, disabled }) {
   return (
     <button onClick={disabled ? undefined : onClick}
@@ -600,14 +915,12 @@ function ActionCard({ icon, title, sub, color, onClick, disabled }) {
     </button>
   )
 }
-
 function Badge({ children, color }) {
   return <span style={{ background: color + '22', color, borderRadius: 6, padding: '2px 8px', fontSize: 13, fontWeight: 600 }}>{children}</span>
 }
-
 function Btn({ icon, children, onClick }) {
   return (
-    <button onClick={onClick} style={{ background: 'transparent', color: '#94A3B8', fontSize: icon ? 18 : 14, padding: '4px 8px', borderRadius: 6 }}>
+    <button onClick={onClick} style={{ background: 'transparent', color: '#94A3B8', fontSize: icon ? 18 : 14, padding: '4px 8px', borderRadius: 6, border: 'none', cursor: 'pointer' }}>
       {children}
     </button>
   )
@@ -628,11 +941,16 @@ const S = {
   secTitle: { fontSize: 12, color: '#64748B', fontWeight: 700, letterSpacing: 1, marginBottom: 10, textTransform: 'uppercase' },
   label: { fontSize: 14, color: '#94A3B8', fontWeight: 500, marginBottom: 8, display: 'block' },
   input: { background: '#0F172A', border: '1.5px solid #334155', borderRadius: 8, color: '#F1F5F9', padding: '11px 14px', fontSize: 15, outline: 'none', width: '100%' },
-  btnPrimary: { background: '#3B82F6', color: '#fff', padding: '13px 24px', borderRadius: 10, fontSize: 15, fontWeight: 600 },
-  btnGhost: { background: 'transparent', color: '#475569', padding: '10px', borderRadius: 8, fontSize: 13 },
-  chip: { padding: '7px 16px', borderRadius: 20, border: '1px solid #334155', background: 'transparent', color: '#94A3B8', fontSize: 13 },
+  btnPrimary: { background: '#3B82F6', color: '#fff', padding: '13px 24px', borderRadius: 10, fontSize: 15, fontWeight: 600, border: 'none', cursor: 'pointer' },
+  btnGhost: { background: 'transparent', color: '#475569', padding: '10px', borderRadius: 8, fontSize: 13, border: 'none', cursor: 'pointer' },
+  chip: { padding: '7px 16px', borderRadius: 20, border: '1px solid #334155', background: 'transparent', color: '#94A3B8', fontSize: 13, cursor: 'pointer' },
   chipActive: { background: '#3B82F6', borderColor: '#3B82F6', color: '#fff' },
   typeBadge: { display: 'inline-block', fontSize: 12, padding: '3px 10px', borderRadius: 20, fontWeight: 600 },
   stem: { fontSize: 16, lineHeight: 1.8, color: '#E2E8F0', whiteSpace: 'pre-wrap' },
   optBtn: { display: 'flex', alignItems: 'center', gap: 12, background: '#1E293B', border: '1.5px solid #334155', borderRadius: 10, padding: '12px 14px', cursor: 'pointer', width: '100%', transition: 'all .15s' },
+  examEntryBtn: { width: '100%', background: '#1E293B', border: '1px solid #334155', borderRadius: 12, padding: '16px 18px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer' },
+  examTimerBar: { display: 'flex', alignItems: 'center', padding: '10px 16px', gap: 8 },
+  examTimer: { fontSize: 22, fontWeight: 900, letterSpacing: 2, fontVariantNumeric: 'tabular-nums' },
+  modal: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', zIndex: 100, padding: '0 0 0 0' },
+  modalCard: { background: '#1E293B', borderRadius: '16px 16px 0 0', padding: 24, width: '100%', maxWidth: 480 },
 }
