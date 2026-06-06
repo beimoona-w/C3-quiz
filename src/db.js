@@ -19,7 +19,6 @@ async function init() {
   initialized = true
 }
 
-// Generate or retrieve a local sync code
 export function getLocalSyncCode() {
   let code = localStorage.getItem('quiz_sync_code')
   if (!code) {
@@ -33,22 +32,23 @@ export function setSyncCode(code) {
   localStorage.setItem('quiz_sync_code', code.trim().toUpperCase())
 }
 
-// Load progress from cloud
 export async function loadProgress(syncCode) {
   try {
     await init()
     const res = await db.collection(COLLECTION).doc(syncCode).get()
-    if (res.data && res.data.length > 0) {
+    if (res.data && typeof res.data === 'object' && !Array.isArray(res.data)) {
+      return res.data.progress || {}
+    }
+    if (Array.isArray(res.data) && res.data.length > 0) {
       return res.data[0].progress || {}
     }
     return {}
   } catch (e) {
-    console.warn('Cloud load failed, using local', e)
-    return null // signal to use local
+    console.warn('Cloud load failed:', e)
+    return null
   }
 }
 
-// Save progress to cloud (debounced)
 let saveTimer = null
 export function saveProgressDebounced(syncCode, progress) {
   clearTimeout(saveTimer)
@@ -60,9 +60,19 @@ export async function saveProgress(syncCode, progress) {
     await init()
     await db.collection(COLLECTION).doc(syncCode).set({
       progress,
-      updatedAt: db.serverDate()
+      updatedAt: new Date().toISOString()
     })
+    console.log('Cloud save OK:', syncCode)
   } catch (e) {
-    console.warn('Cloud save failed', e)
+    try {
+      await db.collection(COLLECTION).add({
+        _id: syncCode,
+        progress,
+        updatedAt: new Date().toISOString()
+      })
+      console.log('Cloud add OK:', syncCode)
+    } catch (e2) {
+      console.warn('Cloud save failed:', e2)
+    }
   }
 }
