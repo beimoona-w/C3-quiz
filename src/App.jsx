@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { getLocalSyncCode, setSyncCode, loadProgress, saveProgressDebounced, saveProgress } from './db.js'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const TYPE_LABEL = { single: '单选', multi: '多选', judge: '判断' }
@@ -15,7 +14,6 @@ export default function App() {
   const [questions, setQuestions] = useState(null)
   const [examDate, setExamDate] = useState(() => localStorage.getItem('examDate') || '')
   const [progress, setProgress] = useState({})
-  const [syncCode, setSyncCodeState] = useState(() => getLocalSyncCode())
   const [view, setView] = useState('loading')
   const [quizQueue, setQuizQueue] = useState([])
   const [quizIdx, setQuizIdx] = useState(0)
@@ -23,7 +21,6 @@ export default function App() {
   const [selectedOpts, setSelectedOpts] = useState([])
   const [submitted, setSubmitted] = useState(false)
   const [filterType, setFilterType] = useState('all')
-  const [syncStatus, setSyncStatus] = useState('idle')
   const [loadingMsg, setLoadingMsg] = useState('加载题库中…')
   // Exam state
   const [examQueue, setExamQueue] = useState([])
@@ -35,13 +32,8 @@ export default function App() {
       const res = await fetch('/questions.json')
       const qs = await res.json()
       setQuestions(qs)
-      setLoadingMsg('同步进度中…')
-      const code = getLocalSyncCode()
-      const cloudProg = await loadProgress(code)
       const localProg = JSON.parse(localStorage.getItem('quiz_progress') || '{}')
-      const merged = { ...localProg, ...(cloudProg || {}) }
-      setProgress(merged)
-      localStorage.setItem('quiz_progress', JSON.stringify(merged))
+      setProgress(localProg)
       const date = localStorage.getItem('examDate')
       setView(date ? 'dash' : 'setup')
     }
@@ -56,8 +48,7 @@ export default function App() {
   const updateProgress = useCallback((newProg) => {
     setProgress(newProg)
     localStorage.setItem('quiz_progress', JSON.stringify(newProg))
-    saveProgressDebounced(syncCode, newProg)
-  }, [syncCode])
+  }, [])
 
   const saveExamDate = (d) => {
     setExamDate(d)
@@ -171,22 +162,16 @@ export default function App() {
     if (!confirm('确定清空所有答题记录？')) return
     setProgress({})
     localStorage.removeItem('quiz_progress')
-    saveProgress(syncCode, {})
   }
 
-  const applySyncCode = async (code) => {
-    setSyncStatus('syncing')
-    setSyncCode(code)
-    setSyncCodeState(code)
-    const cloudProg = await loadProgress(code)
-    if (cloudProg) {
-      setProgress(cloudProg)
-      localStorage.setItem('quiz_progress', JSON.stringify(cloudProg))
-      setSyncStatus('ok')
-    } else {
-      setSyncStatus('err')
+  const restoreProgress = useCallback((prog, date) => {
+    setProgress(prog)
+    localStorage.setItem('quiz_progress', JSON.stringify(prog))
+    if (date !== undefined) {
+      setExamDate(date)
+      localStorage.setItem('examDate', date)
     }
-  }
+  }, [])
 
   if (view === 'loading') return <Loader msg={loadingMsg} />
   if (view === 'setup') return <Setup onSave={saveExamDate} />
@@ -196,8 +181,8 @@ export default function App() {
       doneIds={doneIds} examDate={examDate} filterType={filterType}
       onFilterChange={setFilterType} onStartQuiz={startQuiz}
       onStartExam={startExam}
-      onPlan={() => setView('plan')} onSync={() => setView('sync')}
-      syncCode={syncCode} onReset={resetAll}
+      onPlan={() => setView('plan')} onBackup={() => setView('backup')}
+      onReset={resetAll}
     />
   )
   if (view === 'quiz') return (
@@ -221,8 +206,8 @@ export default function App() {
   if (view === 'plan') return (
     <PlanScreen questions={questions} doneIds={doneIds} examDate={examDate} onBack={() => setView('dash')} />
   )
-  if (view === 'sync') return (
-    <SyncScreen syncCode={syncCode} status={syncStatus} onApply={applySyncCode} onBack={() => setView('dash')} />
+  if (view === 'backup') return (
+    <BackupScreen progress={progress} examDate={examDate} onRestore={restoreProgress} onBack={() => setView('dash')} />
   )
   return null
 }
@@ -268,7 +253,7 @@ function Setup({ onSave }) {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterType, onFilterChange, onStartQuiz, onStartExam, onPlan, onSync, syncCode, onReset }) {
+function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterType, onFilterChange, onStartQuiz, onStartExam, onPlan, onBackup, onReset }) {
   const total = questions?.length || 0
   const done = doneIds.size
   const correct = Object.values(progress).filter(v => v.correct).length
@@ -289,7 +274,7 @@ function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterTyp
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <Btn icon onClick={onPlan}>📅</Btn>
-          <Btn icon onClick={onSync}>🔄</Btn>
+          <Btn icon onClick={onBackup}>💾</Btn>
         </div>
       </div>
 
@@ -344,9 +329,6 @@ function Dashboard({ questions, progress, wrongIds, doneIds, examDate, filterTyp
         </button>
       </div>
 
-      <div style={{ padding: '0 16px 8px', fontSize: 12, color: '#475569', textAlign: 'center' }}>
-        同步码：<strong style={{ color: '#64748B' }}>{syncCode}</strong>
-      </div>
       <div style={{ padding: '0 16px 32px' }}>
         <button style={{ ...S.btnGhost, width: '100%' }} onClick={onReset}>清空答题记录</button>
       </div>
@@ -817,36 +799,86 @@ function PlanScreen({ questions, doneIds, examDate, onBack }) {
   )
 }
 
-// ─── Sync Screen ──────────────────────────────────────────────────────────────
-function SyncScreen({ syncCode, status, onApply, onBack }) {
-  const [input, setInput] = useState(syncCode)
+// ─── Backup Screen ─────────────────────────────────────────────────────────────
+function BackupScreen({ progress, examDate, onRestore, onBack }) {
+  const [restoreInput, setRestoreInput] = useState('')
+  const [restoreMsg, setRestoreMsg] = useState('')
+  const [tab, setTab] = useState('export')
+
+  const exportCode = btoa(encodeURIComponent(JSON.stringify({ progress, examDate })))
+
+  const copyExport = () => {
+    navigator.clipboard.writeText(exportCode).then(() => {
+      setRestoreMsg('已复制到剪贴板')
+      setTimeout(() => setRestoreMsg(''), 2000)
+    }).catch(() => setRestoreMsg('复制失败，请手动复制'))
+  }
+
+  const doImport = () => {
+    try {
+      const data = JSON.parse(decodeURIComponent(atob(restoreInput.trim())))
+      if (!data.progress || typeof data.progress !== 'object') {
+        setRestoreMsg('备份码格式无效')
+        return
+      }
+      onRestore(data.progress, data.examDate || '')
+      setRestoreMsg('✓ 导入成功')
+      setTimeout(() => onBack(), 1000)
+    } catch {
+      setRestoreMsg('备份码格式无效')
+    }
+  }
+
   return (
     <div style={S.page}>
       <div style={S.header}>
         <Btn icon onClick={onBack}>←</Btn>
-        <div style={{ ...S.headerTitle, flex: 1, textAlign: 'center' }}>跨设备同步</div>
+        <div style={{ ...S.headerTitle, flex: 1, textAlign: 'center' }}>备份与恢复</div>
         <div style={{ width: 36 }} />
       </div>
       <div style={{ padding: 16 }}>
-        <div style={{ ...S.card, marginBottom: 16 }}>
-          <div style={{ fontSize: 14, color: '#94A3B8', lineHeight: 1.8 }}>
-            你的<strong style={{ color: '#F1F5F9' }}>同步码</strong>是专属于你的 ID，在另一台设备上输入同样的同步码，即可读取云端进度。
-          </div>
+        <div style={{ display: 'flex', marginBottom: 16, background: '#0F172A', borderRadius: 10, padding: 3 }}>
+          <button onClick={() => setTab('export')}
+            style={{ flex: 1, padding: '10px 0', borderRadius: 8, border: 'none', cursor: 'pointer',
+              fontWeight: 600, fontSize: 14, background: tab === 'export' ? '#1E293B' : 'transparent', color: tab === 'export' ? '#F1F5F9' : '#64748B' }}>
+            导出备份
+          </button>
+          <button onClick={() => setTab('import')}
+            style={{ flex: 1, padding: '10px 0', borderRadius: 8, border: 'none', cursor: 'pointer',
+              fontWeight: 600, fontSize: 14, background: tab === 'import' ? '#1E293B' : 'transparent', color: tab === 'import' ? '#F1F5F9' : '#64748B' }}>
+            导入备份
+          </button>
         </div>
-        <div style={S.secTitle}>当前同步码</div>
-        <div style={{ ...S.card, marginBottom: 16, textAlign: 'center' }}>
-          <div style={{ fontSize: 32, fontWeight: 700, letterSpacing: 6, color: '#3B82F6', padding: '8px 0' }}>{syncCode}</div>
-        </div>
-        <div style={S.secTitle}>切换同步码</div>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-          <input value={input} onChange={e => setInput(e.target.value.toUpperCase())}
-            placeholder="输入同步码" style={{ ...S.input, flex: 1 }} maxLength={10} />
-          <button style={{ ...S.btnPrimary, padding: '0 16px', flexShrink: 0 }}
-            onClick={() => onApply(input)} disabled={!input || input === syncCode}>确认</button>
-        </div>
-        {status === 'syncing' && <div style={{ color: '#94A3B8', fontSize: 13 }}>同步中…</div>}
-        {status === 'ok' && <div style={{ color: '#10B981', fontSize: 13 }}>✓ 同步成功</div>}
-        {status === 'err' && <div style={{ color: '#F59E0B', fontSize: 13 }}>⚠ 该同步码暂无数据</div>}
+
+        {tab === 'export' ? (
+          <>
+            <div style={S.secTitle}>备份码</div>
+            <div style={{ ...S.card, marginBottom: 12 }}>
+              <div style={{ fontSize: 12, color: '#64748B', marginBottom: 8 }}>复制此备份码保存到安全的地方，用于在其他设备恢复进度：</div>
+              <div style={{
+                background: '#0F172A', borderRadius: 8, padding: 14, wordBreak: 'break-all',
+                fontFamily: 'monospace', fontSize: 13, color: '#3B82F6', lineHeight: 1.6, maxHeight: 200, overflowY: 'auto'
+              }}>{exportCode}</div>
+            </div>
+            <button style={{ ...S.btnPrimary, width: '100%' }} onClick={copyExport}>复制备份码</button>
+            {restoreMsg && <div style={{ color: '#10B981', fontSize: 13, textAlign: 'center', marginTop: 8 }}>{restoreMsg}</div>}
+          </>
+        ) : (
+          <>
+            <div style={S.secTitle}>粘贴备份码</div>
+            <div style={{ display: 'flex', gap: 8, flexDirection: 'column' }}>
+              <textarea value={restoreInput} onChange={e => setRestoreInput(e.target.value)}
+                placeholder="粘贴备份码…" rows={5}
+                style={{ ...S.input, fontFamily: 'monospace', fontSize: 13, resize: 'vertical' }} />
+              <button style={{ ...S.btnPrimary, width: '100%', opacity: restoreInput.trim() ? 1 : 0.4 }}
+                disabled={!restoreInput.trim()} onClick={doImport}>导入并恢复进度</button>
+            </div>
+            {restoreMsg && (
+              <div style={{ fontSize: 13, textAlign: 'center', marginTop: 8,
+                color: restoreMsg.includes('成功') ? '#10B981' : '#EF4444' }}>{restoreMsg}</div>
+            )}
+          </>
+        )}
       </div>
     </div>
   )
