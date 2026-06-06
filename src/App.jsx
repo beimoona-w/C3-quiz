@@ -22,11 +22,23 @@ export default function App() {
   const [submitted, setSubmitted] = useState(false)
   const [filterType, setFilterType] = useState('all')
   const [loadingMsg, setLoadingMsg] = useState('加载题库中…')
+  const [diagnostic, setDiagnostic] = useState(null)
   // Exam state
   const [examQueue, setExamQueue] = useState([])
   const [examResult, setExamResult] = useState(null)
 
+  const isDebug = typeof window !== 'undefined' && window.location.search.includes('debug=1')
+
   useEffect(() => {
+    // Capture diagnostic snapshot before bootstrap
+    const all = {}
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      all[k] = localStorage.getItem(k)
+    }
+    const prog = localStorage.getItem('quiz_progress')
+    setDiagnostic({ keys: all, quizProgressRaw: prog, capturedAt: new Date().toISOString() })
+
     async function bootstrap() {
       setLoadingMsg('加载题库中…')
       const res = await fetch('/questions.json')
@@ -172,6 +184,8 @@ export default function App() {
       localStorage.setItem('examDate', date)
     }
   }, [])
+
+  if (isDebug) return <DebugScreen diagnostic={diagnostic} />
 
   if (view === 'loading') return <Loader msg={loadingMsg} />
   if (view === 'setup') return <Setup onSave={saveExamDate} />
@@ -884,6 +898,76 @@ function BackupScreen({ progress, examDate, onRestore, onBack }) {
   )
 }
 
+// ─── Debug Screen ──────────────────────────────────────────────────────────────
+function DebugScreen({ diagnostic }) {
+  const [copied, setCopied] = useState(false)
+
+  if (!diagnostic) {
+    return (
+      <div style={D.page}>
+        <div style={{ color: '#94A3B8', fontSize: 18 }}>读取 localStorage 中…</div>
+      </div>
+    )
+  }
+
+  const { keys, quizProgressRaw, capturedAt } = diagnostic
+  const keyEntries = Object.entries(keys)
+  let progParsed = null
+  let progCount = 0
+  try {
+    progParsed = JSON.parse(quizProgressRaw || '{}')
+    progCount = Object.keys(progParsed).length
+  } catch {}
+
+  const fullData = btoa(encodeURIComponent(JSON.stringify({ capturedAt, keys, quizProgressParsed: progParsed })))
+
+  const copyAll = () => {
+    navigator.clipboard.writeText(fullData).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2500)
+    }).catch(() => setCopied(false))
+  }
+
+  return (
+    <div style={D.page}>
+      <div style={D.header}>
+        <div>
+          <div style={{ fontSize: 22, fontWeight: 900, color: '#F1F5F9' }}>诊断面板</div>
+          <div style={{ fontSize: 13, color: '#64748B', marginTop: 4 }}>
+            快照时间：{capturedAt}　｜　共 {keyEntries.length} 个 key
+          </div>
+        </div>
+        <button style={D.copyBtn} onClick={copyAll}>{copied ? '✓ 已复制' : '复制全部'}</button>
+      </div>
+
+      {/* quiz_progress highlight */}
+      <div style={D.section}>
+        <div style={{ ...D.sectionTitle, color: '#FBBF24' }}>quiz_progress ({progCount} 条答题记录)</div>
+        <div style={D.codeBlock}>{quizProgressRaw || '(空)'}</div>
+      </div>
+
+      {/* All keys */}
+      {keyEntries.map(([k, v]) => (
+        <div key={k} style={{ ...D.section, ...(k === 'quiz_progress' ? { display: 'none' } : {}) }}>
+          <div style={D.sectionTitle}>{k}</div>
+          <div style={D.codeBlock}>{v || '(空)'}</div>
+        </div>
+      ))}
+
+      {/* Encoded full data */}
+      <div style={D.section}>
+        <div style={{ ...D.sectionTitle, color: '#3B82F6' }}>编码后的完整数据（可复制发送）</div>
+        <div style={{ ...D.codeBlock, color: '#3B82F6', fontSize: 12 }}>{fullData}</div>
+      </div>
+
+      <div style={{ padding: 32, textAlign: 'center' }}>
+        <button style={{ background: '#1E293B', border: '1px solid #334155', borderRadius: 10, color: '#94A3B8', padding: '10px 24px', fontSize: 14, cursor: 'pointer' }}
+          onClick={copyAll}>{copied ? '✓ 已复制全部数据' : '复制全部'}</button>
+      </div>
+    </div>
+  )
+}
+
 // ─── Shared Components ────────────────────────────────────────────────────────
 function Ring({ pct, done, total }) {
   const r = 44, circ = 2 * Math.PI * r
@@ -956,6 +1040,16 @@ function Btn({ icon, children, onClick }) {
       {children}
     </button>
   )
+}
+
+// ─── Debug Styles ──────────────────────────────────────────────────────────────
+const D = {
+  page: { minHeight: '100vh', background: '#0A0E14', padding: '16px 16px 32px', maxWidth: 600, margin: '0 auto' },
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20, paddingBottom: 16, borderBottom: '1px solid #1E293B' },
+  copyBtn: { background: '#3B82F6', color: '#fff', border: 'none', borderRadius: 8, padding: '8px 18px', fontSize: 14, fontWeight: 600, cursor: 'pointer', flexShrink: 0 },
+  section: { marginBottom: 16, background: '#111827', borderRadius: 10, padding: 14 },
+  sectionTitle: { fontSize: 14, fontWeight: 700, color: '#94A3B8', marginBottom: 8, wordBreak: 'break-all' },
+  codeBlock: { background: '#0A0E14', borderRadius: 8, padding: 12, fontSize: 14, fontFamily: 'monospace', color: '#CBD5E1', lineHeight: 1.7, wordBreak: 'break-all', whiteSpace: 'pre-wrap', overflowX: 'auto', maxHeight: 320, overflowY: 'auto' },
 }
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
